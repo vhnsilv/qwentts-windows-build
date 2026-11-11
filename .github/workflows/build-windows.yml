@@ -1,0 +1,123 @@
+# Compila o qwentts.cpp (software aberto, MIT) para Windows x64, variantes CPU e Vulkan.
+# Somente manual (workflow_dispatch). O codigo do upstream NAO e copiado para este repositorio:
+# o job clona o commit fixado abaixo. Nao baixa modelos. Nao ha retry nem reexecucao automatica.
+name: build-qwentts-windows
+
+on:
+  workflow_dispatch: {}   # somente manual; sem push, sem schedule, sem pull_request
+
+permissions:
+  contents: read          # sem segredos, sem escrita no repositorio
+
+concurrency:
+  group: build-qwentts-windows
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/ServeurpersoCom/qwentts.cpp.git
+  UPSTREAM_COMMIT: de2ad833e9bd5c06082231d1da637789f7562816   # master em 2026-11-06
+  GGML_COMMIT: 210138933b22221ced02943b7b6e4308610ab530       # submodulo ggml desse commit
+  VULKAN_SDK_VERSION: 1.4.363.1
+  VULKAN_SDK_SHA256: c02932bd9a968b22d404536108adaacac908c081cd6b0113f5bfefc523dd0a6a
+
+jobs:
+  build:
+    name: build (${{ matrix.variant }})
+    runs-on: windows-2022          # imagem fixa (VS 2022 17.14, CMake 3.31.x, Ninja); nao usar -latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu
+            vulkan: "OFF"
+          - variant: vulkan
+            vulkan: "ON"
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Clonar upstream no commit fixado e conferir submodulo
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --no-checkout $env:UPSTREAM_URL src
+          if ($LASTEXITCODE) { throw "git clone falhou" }
+          git -C src checkout --detach $env:UPSTREAM_COMMIT
+          if ($LASTEXITCODE) { throw "git checkout falhou" }
+          if ((git -C src rev-parse HEAD) -ne $env:UPSTREAM_COMMIT) { throw "commit do upstream difere do fixado" }
+          git -C src submodule update --init --recursive
+          if ($LASTEXITCODE) { throw "submodule update falhou" }
+          if ((git -C src/ggml rev-parse HEAD) -ne $env:GGML_COMMIT) { throw "commit do ggml difere do fixado" }
+
+      - name: Instalar Vulkan SDK (somente variante vulkan; hash conferido)
+        if: matrix.vulkan == 'ON'
+        run: |
+          $exe = "$env:RUNNER_TEMP\vulkan-sdk.exe"
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_SDK_VERSION.exe" -OutFile $exe
+          $got = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $env:VULKAN_SDK_SHA256) { throw "SHA-256 do Vulkan SDK difere do fixado: $got" }
+          $p = Start-Process $exe -Wait -PassThru -ArgumentList '--accept-licenses','--default-answer','--confirm-command','install'
+          if ($p.ExitCode -ne 0) { throw "instalador do Vulkan SDK saiu com codigo $($p.ExitCode)" }
+          $sdk = "C:\VulkanSDK\$env:VULKAN_SDK_VERSION"
+          if (-not (Test-Path "$sdk\Bin\glslc.exe")) { throw "glslc.exe ausente apos instalar o SDK" }
+          "VULKAN_SDK=$sdk" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+          "$sdk\Bin" | Out-File -Append -Encoding ascii $env:GITHUB_PATH
+
+      - name: Configurar e compilar
+        # GGML_NATIVE=OFF: sem -march=native do runner (poderia emitir AVX-512, ausente em muitas CPUs desktop).
+        # AVX2/FMA/F16C/BMI2 explicitos. Sem OpenMP e CRT estatico (/MT): nenhuma DLL do VC++ para redistribuir.
+        run: |
+          cmake -S src -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON `
+            -DGGML_AVX512=OFF -DGGML_OPENMP=OFF -DGGML_CUDA=OFF -DGGML_VULKAN=${{ matrix.vulkan }}
+          if ($LASTEXITCODE) { throw "cmake configure falhou" }
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE) { throw "cmake build falhou" }
+
+      - name: Empacotar somente EXE, DLLs necessarias, licencas, manifesto e hashes
+        run: |
+          $out = "dist\qwentts-windows-x64-${{ matrix.variant }}"
+          New-Item -ItemType Directory -Force $out, "$out\licenses" | Out-Null
+          $exes = 'tts-server.exe','qwen-tts.exe','qwen-codec.exe','quantize.exe'
+          foreach ($n in $exes) {
+            $f = Get-ChildItem build -Recurse -Filter $n | Where-Object { $_.FullName -match '\\Release\\' -or $_.DirectoryName -eq (Resolve-Path build).Path } | Select-Object -First 1
+            if ($f) { Copy-Item $f.FullName $out } elseif ($n -eq 'tts-server.exe') { throw "tts-server.exe nao foi gerado" }
+          }
+          # DLLs: so as geradas por este build (ggml*.dll), se houver; nunca do sistema nem do runner.
+          Get-ChildItem build -Recurse -Filter 'ggml*.dll' | ForEach-Object { Copy-Item $_.FullName $out -Force }
+          foreach ($p in 'LICENSE','ggml\LICENSE','vendor\cpp-httplib\LICENSE','vendor\yyjson\LICENSE') {
+            $src = Join-Path src $p
+            if (Test-Path $src) { Copy-Item $src ("$out\licenses\" + ($p -replace '[\\/]','_')) }
+          }
+          # Dependencias: nenhuma DLL do VC++ (precisaria de redistribuivel); vulkan-1.dll vem do driver.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe | Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          $deps = @{}
+          foreach ($e in Get-ChildItem $out -Filter *.exe) {
+            $list = & $dumpbin.FullName /dependents $e.FullName | Select-String '^\s+\S+\.dll$' | ForEach-Object { $_.Line.Trim().ToLower() }
+            $deps[$e.Name] = @($list)
+            $bad = $list | Where-Object { $_ -match '^(vcruntime|msvcp|vcomp|concrt)' }
+            if ($bad) { throw "$($e.Name) depende de DLL do VC++: $bad" }
+          }
+          "upstream=$env:UPSTREAM_URL`ncommit=$env:UPSTREAM_COMMIT`nggml=$env:GGML_COMMIT" | Set-Content "$out\SOURCE_COMMIT.txt" -Encoding ascii
+          $files = Get-ChildItem $out -Recurse -File | Where-Object { $_.Name -notin 'MANIFEST.json','SHA256SUMS.txt' }
+          $hashes = $files | ForEach-Object { [ordered]@{ path = $_.FullName.Substring((Resolve-Path $out).Path.Length + 1); sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(); bytes = $_.Length } }
+          [ordered]@{
+            upstream = $env:UPSTREAM_URL; upstream_commit = $env:UPSTREAM_COMMIT; ggml_commit = $env:GGML_COMMIT
+            variant = '${{ matrix.variant }}'; image_version = $env:ImageVersion
+            cmake = (cmake --version | Select-Object -First 1); msvc_install = $vs
+            vulkan_sdk = $(if ('${{ matrix.vulkan }}' -eq 'ON') { $env:VULKAN_SDK_VERSION } else { $null })
+            flags = 'GGML_NATIVE=OFF AVX/AVX2/FMA/F16C/BMI2 ON, AVX512 OFF, OPENMP OFF, CRT=/MT, CUDA OFF'
+            dll_dependents = $deps; files = $hashes
+          } | ConvertTo-Json -Depth 6 | Set-Content "$out\MANIFEST.json" -Encoding utf8
+          ($hashes | ForEach-Object { "$($_.sha256)  $($_.path -replace '\\','/')" }) | Set-Content "$out\SHA256SUMS.txt" -Encoding ascii
+          Get-Content "$out\SHA256SUMS.txt"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+        with:
+          name: qwentts-windows-x64-${{ matrix.variant }}
+          path: dist/qwentts-windows-x64-${{ matrix.variant }}
+          if-no-files-found: error
+          retention-days: 14
